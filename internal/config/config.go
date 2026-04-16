@@ -30,8 +30,11 @@ func defaults() *Config {
 	return &Config{
 		Lima: LimaConfig{VMName: "devbox"},
 		Belayer: BelayerConfig{
-			SocketPath:     "/run/user/1000/belayer/belayer.sock",
-			WorkspaceMount: "~/crag-workspaces",
+			SocketPath: "/run/user/1000/belayer/belayer.sock",
+			// Absolute in-VM path. `~` is intentionally avoided — the value is
+			// shellQuoted into commands run via `bash -lc`, where single quotes
+			// suppress tilde expansion.
+			WorkspaceMount: "/var/tmp/crag-workspaces",
 			Binary:         "belayer",
 		},
 	}

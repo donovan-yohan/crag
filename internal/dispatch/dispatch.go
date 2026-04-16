@@ -58,33 +58,93 @@ func (d *Dispatcher) Submit(ctx context.Context, req Request) (string, error) {
 }
 
 // Wait polls Status until the session reports a terminal state. Repeated
-// status lines are deduped so the user only sees transitions.
+// status lines are deduped so the user only sees transitions. A successful
+// terminal state returns nil; a failure state returns an error so `crag run`
+// exits non-zero. Transient Status errors retry a few times with backoff —
+// limactl/SSH can hiccup, and a single blip shouldn't abort a long-running
+// session. On context cancellation Wait fires a best-effort `belayer cancel`
+// inside the VM, since killing limactl on the host doesn't propagate through
+// SSH to the in-VM belayer process.
 func (d *Dispatcher) Wait(ctx context.Context, sessionID string) error {
-	tick := time.NewTicker(5 * time.Second)
-	defer tick.Stop()
+	const (
+		pollInterval = 5 * time.Second
+		maxRetries   = 3
+	)
 
-	var last string
+	defer func() {
+		if ctx.Err() != nil {
+			d.cancelInVM(sessionID)
+		}
+	}()
+
+	var (
+		last       string
+		retries    int
+		retryDelay = pollInterval
+	)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		status, err := d.Status(ctx, sessionID)
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			retries++
+			if retries > maxRetries {
+				return fmt.Errorf("status check failed %d times in a row: %w", retries, err)
+			}
+			fmt.Fprintf(os.Stderr, "[%s] %s status check failed (attempt %d/%d): %v\n",
+				time.Now().Format(time.RFC3339), sessionID, retries, maxRetries, err)
+			if err := sleep(ctx, retryDelay); err != nil {
+				return err
+			}
+			retryDelay += pollInterval
+			continue
 		}
+		retries = 0
+		retryDelay = pollInterval
+
 		if status != last {
 			fmt.Printf("[%s] %s %s\n", time.Now().Format(time.RFC3339), sessionID, status)
 			last = status
 		}
-		if isTerminal(status) {
+		switch classify(status) {
+		case statusSucceeded:
 			return nil
+		case statusFailed:
+			return fmt.Errorf("session %s ended with status: %s", sessionID, status)
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-tick.C:
+		if err := sleep(ctx, pollInterval); err != nil {
+			return err
 		}
 	}
+}
+
+// sleep blocks for d or until ctx is cancelled.
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// cancelInVM fires `belayer cancel <sessionID>` inside the VM using a fresh
+// context so it runs even after the parent context is already cancelled.
+// Best-effort: we have no useful response to a cancel failure beyond the
+// log line.
+func (d *Dispatcher) cancelInVM(sessionID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fmt.Fprintf(os.Stderr, "[%s] %s cancelling in-VM session...\n",
+		time.Now().Format(time.RFC3339), sessionID)
+	cmd := d.vm.Shell(ctx, "bash", "-lc", d.belayerCmd(sessionID, "", "cancel"))
+	_ = cmd.Run()
 }
 
 // Status returns belayer's status output for the given session.
@@ -140,15 +200,27 @@ func (d *Dispatcher) resolveWorkspace(ctx context.Context, source string) (strin
 	if _, err := os.Stat(abs); err != nil {
 		return "", err
 	}
-
+	// Resolve symlinks on both sides before comparing — otherwise a
+	// symlinked workspace under $HOME pointing outside it (or a subtle
+	// prefix collision like /Users/alice-evil under /Users/alice) sneaks
+	// past a naive HasPrefix check.
+	absReal, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	if !strings.HasPrefix(abs, home) {
-		return "", fmt.Errorf("local path %s is outside $HOME; lima only auto-mounts $HOME", abs)
+	homeReal, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return "", err
 	}
-	return abs, nil
+	sep := string(os.PathSeparator)
+	if absReal != homeReal && !strings.HasPrefix(absReal, homeReal+sep) {
+		return "", fmt.Errorf("local path %s resolves to %s, outside $HOME (%s); lima only auto-mounts $HOME", abs, absReal, homeReal)
+	}
+	return absReal, nil
 }
 
 func (d *Dispatcher) cloneInVM(ctx context.Context, source string) (string, error) {
@@ -188,26 +260,43 @@ func repoName(source string) string {
 	return strings.TrimSuffix(path.Base(source), ".git")
 }
 
-// terminalStatuses are the exact tokens belayer emits on a terminated session.
-// Matched against any whitespace-separated word in Status output, so we don't
-// false-positive on words like "uncompleted".
-var terminalStatuses = map[string]bool{
-	"completed": true,
-	"complete":  true,
-	"finished":  true,
-	"failed":    true,
-	"errored":   true,
-	"cancelled": true,
-	"canceled":  true,
-}
+type statusKind int
 
-func isTerminal(status string) bool {
-	for _, word := range strings.Fields(strings.ToLower(status)) {
-		if terminalStatuses[strings.Trim(word, ".,;:!?")] {
-			return true
-		}
+const (
+	statusActive statusKind = iota
+	statusSucceeded
+	statusFailed
+)
+
+var (
+	successStatuses = map[string]bool{
+		"completed": true,
+		"complete":  true,
+		"finished":  true,
 	}
-	return false
+	failureStatuses = map[string]bool{
+		"failed":    true,
+		"errored":   true,
+		"cancelled": true,
+		"canceled":  true,
+	}
+)
+
+// classify assumes belayer `status` emits a single canonical status token.
+// Only an exact match (after lowercase + trim) is treated as terminal —
+// prose like "running (last completed step: clone)" stays active. This is
+// conservative: if belayer's output format ever changes we loop until the
+// user Ctrl-Cs, which is preferable to misreporting success or failure.
+func classify(status string) statusKind {
+	token := strings.TrimSpace(strings.ToLower(status))
+	switch {
+	case successStatuses[token]:
+		return statusSucceeded
+	case failureStatuses[token]:
+		return statusFailed
+	default:
+		return statusActive
+	}
 }
 
 // shellQuote wraps s in single quotes for safe inclusion in a bash command.

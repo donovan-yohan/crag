@@ -146,3 +146,20 @@ machine that isn't the one running the worker.
   `~/.crag/last-session` so CLI ergonomics survive without a real registry.
   When the daemon lands, this file goes away in favor of an actual session
   store.
+
+## Known limitations deferred to Phase 5
+
+An adversarial code review (2026-04-16) found a handful of issues. P0/P1 are
+fixed; P2s are listed here so they aren't lost when crag goes from PoC to
+something meant to handle more than one user/session.
+
+| Issue | Why it's tolerable for the PoC | Fix shape (Phase 5+) |
+|---|---|---|
+| First-poll race: `Submit` returns before belayer registers the session, so the first `Status` poll can race | Subsequent polls converge | Have `Submit` wait for the first non-error `Status` before returning, or have belayer ack registration |
+| Concurrent runs corrupt `~/.crag/last-session` | We assume one in-flight run at a time | Replace flat file with a real session store (sqlite) when `cragd` lands |
+| Non-atomic writes to `~/.crag/last-session` and `~/.crag/config.yaml` | Crash window is small; both files are recoverable | Write-then-rename via `os.Rename` |
+| `Status` has no per-call timeout — a wedged `limactl shell` blocks forever | The retry-with-backoff in `Wait` masks this for now | `context.WithTimeout` per `Status` call |
+| `~/.crag/last-session` written `0o644` (world-readable) | Session ids are not secrets in the PoC | `0o600` once they imply auth |
+
+These all matter once crag stops being "one user, one in-flight run, on one
+laptop." They don't gate the Phase 4 → Phase 5 demo.

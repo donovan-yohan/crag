@@ -49,7 +49,7 @@ lima:
   vm_name: devbox
 belayer:
   socket_path: /run/user/1000/belayer/belayer.sock
-  workspace_mount: ~/crag-workspaces
+  workspace_mount: /var/tmp/crag-workspaces
   binary: belayer
 ```
 
