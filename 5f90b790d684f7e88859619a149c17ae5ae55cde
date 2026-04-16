@@ -1,0 +1,29 @@
+internal/config/config.go
+  5675b10eef084412 33-37
+docs/design-docs/2026-04-16-worker-abstraction-and-remote-topology.md
+  5675b10eef084412 149-165
+internal/dispatch/dispatch.go
+  5675b10eef084412 61-67,69-72,74-84,91-104,106-108,113-114,116-117,119-120,125-149,203-210,215-217,219-223,263,265-298
+README.md
+  5675b10eef084412 52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "5f90b790d684f7e88859619a149c17ae5ae55cde",
+  "prompts": {
+    "5675b10eef084412": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4ad64ac8-3dc5-4e1a-ac1a-427fe4d7e310",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Donovan Yohan",
+      "messages": [],
+      "total_additions": 144,
+      "total_deletions": 35,
+      "accepted_lines": 144,
+      "overriden_lines": 0
+    }
+  }
+}
